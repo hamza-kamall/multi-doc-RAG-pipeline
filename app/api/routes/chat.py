@@ -1,59 +1,49 @@
-import json
-from pathlib import Path
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-
+from app.rag.pipeline import app as build_graph
+from app.rag.retriever import get_retriever
 router = APIRouter(prefix="/chat", tags=["chat"])
-
-CHUNKS_DIR = Path("uploads") / "chunks"
 
 class ChatRequest(BaseModel):
     document_id: str
     query: str
 
 
-
-
 @router.post("")
-def chat_with_document(request: ChatRequest) -> dict[str, str | list[dict[str, str | int]]]:
-    chunks_path = CHUNKS_DIR / f"{request.document_id}.json"
+def chat_with_document(
+    request: ChatRequest,
+) -> dict[str, str | list[dict[str, str | int]]]:
+    query = request.query.strip()
 
-    if not chunks_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Chunks not found. Index the document first.",
-        )
-
-    question = request.query.strip().lower()
-
-    if not question:
+    if not query:
         raise HTTPException(status_code=400, detail="Question is required.")
 
-    with open(chunks_path, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
+    retriever = get_retriever(document_id=request.document_id)
+    graph = build_graph(retriever)
+    result = graph.invoke(
+        {
+            "question": query,
+            "document_id": request.document_id,
+            "retry_count": 0,
+        }
+    )
+    result_documents = result.get("documents", [])
 
-    results = []
 
-    for chunk in chunks:
-        text = str(chunk["text"])
-        score = text.lower().count(question)
-
-        if score > 0:
-            results.append(
-                {
-                    "chunk_id": chunk["chunk_id"],
-                    "document_id": chunk["document_id"],
-                    "chunk_index": chunk["chunk_index"],
-                    "score": score,
-                    "text": text,
-                }
-            )
-
-    results.sort(key=lambda item: item["score"], reverse=True)
+    context = [
+        {
+            "chunk_id": doc.metadata.get("chunk_id", "unknown"),
+            "document_id": doc.metadata.get("document_id", "unknown"),
+            "chunk_index": doc.metadata.get("chunk_index", -1),
+            "text": doc.page_content,
+        }
+        for doc in result_documents
+    ]
 
     return {
-        "answer": "LLM generation is not connected yet. Here are the retrieved chunks.",
-        "context": results[:3],
+        "answer": result["generation"],
+        "context": context,
     }
+
+

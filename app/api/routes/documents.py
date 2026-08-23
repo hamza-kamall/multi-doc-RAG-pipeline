@@ -183,7 +183,7 @@ def search_doc_chunks(document_id: str, request: request) -> list[dict[str, str 
 def semantic_search_doc(document_id: str, request: request) :
     from app.rag.retriever import get_retriever
 
-    retriever = get_retriever(id = document_id)
+    retriever = get_retriever(document_id=document_id)
     query = request.query.strip()
 
     if not query:
