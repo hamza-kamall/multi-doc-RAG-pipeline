@@ -1,14 +1,15 @@
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_groq import ChatGroq
 
 from app.core.config import get_settings
 
 
-def get_llm() -> ChatGoogleGenerativeAI:
+def get_llm() -> ChatGroq:
     settings = get_settings()
 
-    return ChatGoogleGenerativeAI(
-        model=settings.gemini_model,
-        google_api_key=settings.gemini_api_key,
+    return ChatGroq(
+        model=settings.groq_generation_model,
+        api_key=settings.groq_api_key,
+        temperature=0,
     )
 
 
@@ -31,8 +32,7 @@ Answer:
 
     response = llm.invoke(prompt)
 
-    # Gemini 3 may return structured content blocks rather than a bare string.
-    # AIMessage.text normalizes both response formats to plain text.
+    # Return only the assistant's answer text, not provider metadata.
     return response.text
 
 

@@ -93,7 +93,7 @@ def test_general_question_uses_direct_llm_fallback(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "generate_general_answer",
-        lambda question: "Hello from Gemini",
+        lambda question: "Hello from the generation model",
     )
 
     result = pipeline.app(retriever).invoke({
@@ -102,7 +102,7 @@ def test_general_question_uses_direct_llm_fallback(monkeypatch):
         "retry_count": 0,
     })
 
-    assert result["generation"] == "Hello from Gemini"
+    assert result["generation"] == "Hello from the generation model"
     assert retriever.questions == []
 
 

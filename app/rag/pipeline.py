@@ -21,23 +21,27 @@ fast_llm = ChatGroq(
 )
 
 class web_search(BaseModel):
-    """The internet.Use web_search for any query other than RAG-related."""
+    """Search the internet. Reserved for fallback after document retrieval is insufficient."""
     query: str = Field(..., description="The query to search the web for.")
 
 class vectorstoresearch(BaseModel):
-    """The vector store. Use vectorstore for RAG-related queries."""
+    """Search the user's selected document. Use first for every document-chat question, regardless of topic."""
     query: str = Field(..., description="The query to search the vectorstore for.")
 
 # Router instructions: choose between vector search, web search, or no tool.
 preamble = """
-You are a routing assistant.
+You are the initial routing assistant for a document question-answering endpoint.
+The user has selected an uploaded document and expects it to be searched first.
 
 Rules:
-- Use vectorstore ONLY for RAG/Retrieval-Augmented Generation .
-- Use web_search ONLY for weather, news, current events, and internet knowledge.
-- If no tool is needed, answer normally without calling any tool call.
-
-DONOT GIVE REASONING FOR YOUR APPROACH TO THE USER. ALWAYS ANSWER IN A CONCISE STRING MANNER.
+- Always call vectorstoresearch with the user's question as the query.
+- Search the selected document regardless of the question's topic. Questions
+  about LLMs, RAG, definitions, facts, or current events all start with document retrieval.
+- Do not assume the document lacks an answer based on the question alone.
+- Do not call web_search at this initial stage. The graph handles web fallback
+  only after document retrieval or answer grading indicates it is needed.
+- Do not answer from your own knowledge or return a plain-text response.
+- Return only the vectorstoresearch tool call, without an explanation.  
 """
 
 # Bind the tool schemas so the model can return a tool call as its routing decision.
@@ -58,10 +62,12 @@ class grading(BaseModel):
 # Relevance grader instructions.
 preamble = """You are a grading assistant. You will be given a query and a set of retrieved documents. Your \n
 if the retrieved document contains any keyword(s) or any semantic meaning related to the query, then return \n 
-'yes' otherwise return 'no'. Always answer in yes or no only. Do not give any explanation."""
+'yes' in the score field; otherwise set score to 'no'. Return only the JSON object required by the schema. Do not give any explanation."""
 
 # Chain that grades whether a retrieved document should be kept.
-structured_grading_output = fast_llm.with_structured_output(grading)
+structured_grading_output = fast_llm.with_structured_output(
+    grading, method="json_schema", strict=True
+)
 
 grading_prompt = ChatPromptTemplate.from_messages([
     ("system", preamble),
@@ -75,11 +81,13 @@ class GradeHallucination(BaseModel):
                         description = 'Answer is grounded to the retrieved documents. "Yes" or "No"')
     
 # Chain that verifies the generated answer is supported by retrieved context.
-structured_llm = fast_llm.with_structured_output(GradeHallucination)
+structured_llm = fast_llm.with_structured_output(
+    GradeHallucination, method="json_schema", strict=True
+)
 
 prompt = ChatPromptTemplate.from_messages([
     ("system", """You are a hallucination grading assistant. your job is to check whether the answer is grounded/supported with the retrieved documents.\n
-     "yes" if the answer is grounded/supported and "no" if the answer is not grounded/supported. Always answer in yes or no only. Do not give any explanation."""),
+     Set hall_score to "yes" if the answer is grounded/supported and "no" if the answer is not grounded/supported. Return only the JSON object required by the schema. Do not give any explanation."""),
      ("human","query : {query} \n retrieved_docs : {retrieved_docs} \n answer : {answer}")
 ])
 
@@ -90,10 +98,12 @@ class grader(BaseModel):
     score : Literal["yes", "no"] = Field(description = 'Answer resolves the query. "Yes" or "No"')
 
 # Chain that checks whether the answer is useful for the original question.
-structured_llm = fast_llm.with_structured_output(grader)
+structured_llm = fast_llm.with_structured_output(
+    grader, method="json_schema", strict=True
+)
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a grading assistant. Your job is to check whether the answer resolves the query or not. "Yes" if the answer resolves the query and "No" if it does not resolve the query. Always answer in yes or no only. Do not give any explanation."""),
+    ("system", """You are a grading assistant. Your job is to check whether the answer resolves the query or not. Set score to "yes" if the answer resolves the query and "no" if it does not resolve the query. Return only the JSON object required by the schema. Do not give any explanation."""),
     ("human","query : {query} \n answer : {answer}")
 ])
 

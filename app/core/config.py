@@ -8,10 +8,9 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     environment: str = "local"
     log_level: str = "INFO"
-    gemini_api_key: str
-    gemini_model: str = "gemini-3.6-flash"
     groq_api_key: str
-    groq_model: str = "llama-3.1-8b-instant"
+    groq_model: str = "openai/gpt-oss-20b"
+    groq_generation_model: str = "openai/gpt-oss-120b"
     tavily_api_key: str | None = None
     chroma_dir: str = "chroma_db"
     chroma_collection: str = "rag_docs"

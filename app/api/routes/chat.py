@@ -1,4 +1,8 @@
 from typing import Annotated
+import logging
+
+import httpx
+from groq import APIConnectionError
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
@@ -13,6 +17,8 @@ from app.schemas.chat import ChatRequest, ChatResponse
 from app.schemas.documents import ChunkResponse
 from app.services.documents import get_user_document
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/chat",
@@ -59,14 +65,22 @@ async def chat_with_document(
     retriever = get_retriever(document_id=document_id)
     graph = build_graph(retriever)
 
-    result = await run_in_threadpool(
-        graph.invoke,
-        {
-            "question": query,
-            "document_id": document_id,
-            "retry_count": 0,
-        },
-    )
+    try:
+        result = await run_in_threadpool(
+            graph.invoke,
+            {
+                "question": query,
+                "document_id": document_id,
+                "retry_count": 0,
+            },
+        )
+    except (httpx.TransportError, APIConnectionError) as exc:
+        # Do not expose provider request URLs, credentials, or document text.
+        logger.warning("Chat provider transport failure: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="AI provider temporarily unavailable. Please try again shortly.",
+        ) from exc
 
     context = [
         ChunkResponse(

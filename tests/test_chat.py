@@ -1,4 +1,7 @@
 from langchain_core.documents import Document as LangChainDocument
+import httpx
+import pytest
+from groq import APIConnectionError
 
 from app.api.routes import chat, documents
 
@@ -8,6 +11,35 @@ def upload_text(client, text: bytes = b"Supporting text"):
         "/documents/upload",
         files={"file": ("notes.txt", text, "text/plain")},
     )
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout, APIConnectionError])
+def test_chat_returns_503_on_provider_transport_failure(
+    authenticated_client,
+    monkeypatch,
+    isolated_document_storage,
+    error_type,
+):
+    uploaded = upload_and_index(authenticated_client, monkeypatch)
+
+    class FailingGraph:
+        def invoke(self, state):
+            if error_type is APIConnectionError:
+                raise APIConnectionError(request=httpx.Request("POST", "https://api.groq.com"))
+            raise error_type("SSL connection failed; private provider details")
+
+    monkeypatch.setattr(chat, "get_retriever", lambda document_id: object())
+    monkeypatch.setattr(chat, "build_graph", lambda retriever: FailingGraph())
+
+    response = authenticated_client.post(
+        "/chat",
+        json={"document_id": uploaded["document_id"], "query": "What is an LLM?"},
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "AI provider temporarily unavailable. Please try again shortly."
+    }
 
 
 def upload_and_index(client, monkeypatch):
