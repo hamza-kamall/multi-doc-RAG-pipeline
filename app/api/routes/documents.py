@@ -4,47 +4,34 @@ from pathlib import Path
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.concurrency import run_in_threadpool
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from fastapi.concurrency import run_in_threadpool
+
 from app.api.dependencies.auth import get_current_user
 from app.db.database import get_db
 from app.models import Document, User
-from app.schemas.documents import DocumentIndexResponse, DocumentResponse
-from app.rag.vectorstore import add_chunks_to_vectorstore
+from app.schemas.documents import ChunkResponse, DocumentResponse, DocumentDeleteResponse, SearchRequest
 from app.services.documents import (
     create_document,
     get_user_document,
     list_user_documents,
     update_document_status,
+    delete_document
 )
+from app.services.text_extraction import (
+    TextExtractionError,
+    extract_document_text,
+)
+from app.rag.vectorstore import add_chunks_to_vectorstore,delete_document_from_vectorstore
 
 UPLOAD_DIR = Path("uploads")
 CHUNKS_DIR = UPLOAD_DIR / "chunks"
-METADATA_FILE = UPLOAD_DIR / "documents.json"
 allowed_types = {"application/pdf", "text/csv", "text/plain"}
 router = APIRouter(prefix="/documents", tags=["documents"])
-
-
-def load_docs() -> list[dict[str, str | int]]:
-    if not METADATA_FILE.exists():
-        return []
-
-    if METADATA_FILE.stat().st_size == 0:
-        return []
-
-    with open(METADATA_FILE, "r") as f:
-        return json.load(f)
-
-
-def upload_docs(docs: list[dict[str, str | int]]) -> None:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-    with open(METADATA_FILE, "w") as f:
-        json.dump(docs, f, indent=4)
 
 
 # FastAPI receives UploadFile object
@@ -132,15 +119,12 @@ async def get_doc(
     return document
 
 
-@router.post(
-    "/{document_id}/index",
-    response_model=DocumentIndexResponse,
-)
+@router.post("/{document_id}/index")
 async def index_doc(
     document_id: uuid.UUID,
     session: Annotated[AsyncSession, Depends(get_db)],
     current_user: Annotated[User, Depends(get_current_user)],
-) -> DocumentIndexResponse:
+) -> dict[str, str | int]:
     document = await get_user_document(
         session,
         document_id=document_id,
@@ -161,18 +145,36 @@ async def index_doc(
             detail="File not found on disk.",
         )
 
-    if document.content_type != "text/plain":
+    if document.content_type not in {
+        "text/plain",
+        "application/pdf",
+    }:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only plain text files can be indexed.",
+            detail="Only plain text and PDF files can be indexed.",
         )
 
-    text = file_path.read_text(encoding="utf-8")
-
-    if not text.strip():
+    try:
+        text = await run_in_threadpool(
+            extract_document_text,
+            file_path,
+            document.content_type,
+        )
+    except TextExtractionError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="File is empty.",
+            detail=str(exc),
+        ) from exc
+
+    if not text.strip():
+        detail = (
+            "PDF contains no extractable text."
+            if document.content_type == "application/pdf"
+            else "File is empty."
+        )
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=detail,
         )
 
     splitter = RecursiveCharacterTextSplitter(
@@ -210,109 +212,146 @@ async def index_doc(
         "indexed",
     )
 
-    return DocumentIndexResponse(
-        document_id=document.id,
-        original_filename=document.original_filename,
-        stored_filename=document.stored_filename,
-        content_type=document.content_type,
-        size_bytes=document.size_bytes,
-        status=document.status,
-        created_at=document.created_at,
-        length=len(text),
-        num_chunks=len(chunks),
-        embedded_chunks=embedded_chunks_count,
-    )
+    return {
+        "document_id": document_id_text,
+        "original_filename": document.original_filename,
+        "stored_filename": document.stored_filename,
+        "content_type": document.content_type,
+        "size_bytes": document.size_bytes,
+        "status": document.status,
+        "length": len(text),
+        "num_chunks": len(chunks),
+        "embedded_chunks": embedded_chunks_count,
+    }
 
 
-@router.get("/{document_id}/chunks")
-def get_doc_chunks(    document_id: uuid.UUID,
+@router.get("/{document_id}/chunks",response_model=list[ChunkResponse])
+async def get_doc_chunks(
+    document_id: uuid.UUID,
     session: Annotated[AsyncSession, Depends(get_db)],
-    current_user: Annotated[User, Depends(get_current_user)]) -> list[dict[str, str | int]]:
-    path = CHUNKS_DIR / f"{document_id}.json"
+    current_user: Annotated[User, Depends(get_current_user)]
+    ) -> list[ChunkResponse]:
 
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Chunks not found for the specified document")
+    document = await get_user_document(
+            session,
+            document_id=document_id,
+            user_id=current_user.id,
+        )
+    
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+    
+    chunk_path = CHUNKS_DIR / f"{document.id}.json"
 
-    with open(path, "r", encoding="utf-8") as f:
+    if not chunk_path.exists():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Chunks not found for the specified document.",
+        )
+    
+    with open(chunk_path, "r", encoding="utf-8") as f:
         chunks = json.load(f)
 
     return chunks
 
-class request(BaseModel) :
-    query : str
-
-@router.post("/{document_id}/chunks/search")
-def search_doc_chunks(document_id: str, request: request) -> list[dict[str, str | int]]:
-    path = CHUNKS_DIR / f"{document_id}.json"
-
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Chunks not found for the specified document")
-
-    with open(path, "r", encoding="utf-8") as f:
-        chunks = json.load(f)
-
-    query = request.query.lower()
-    results =[]
-
-    for chunk in chunks :
-        text = str(chunk["text"]).lower()
-        score = text.count(query)
-
-        if score > 0 :
-            results.append({
-                "chunk_id": chunk["chunk_id"],
-                "document_id": chunk["document_id"],
-                "chunk_index": chunk["chunk_index"],
-                "text": chunk["text"],
-                "score": score
-            })
-    return results
-
-@router.post("/{document_id}/semantic-search")
-def semantic_search_doc(document_id: str, request: request) :
+@router.post(
+    "/{document_id}/semantic-search",
+    response_model=list[ChunkResponse],
+)
+async def semantic_search_doc(
+    document_id: uuid.UUID,
+    request: SearchRequest,
+    session: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> list[ChunkResponse]:
     from app.rag.retriever import get_retriever
 
-    retriever = get_retriever(document_id=document_id)
+    document = await get_user_document(
+        session,
+        document_id=document_id,
+        user_id=current_user.id,
+    )
+
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
+
+    if document.status != "indexed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document has not been indexed.",
+        )
+
     query = request.query.strip()
 
     if not query:
-        raise HTTPException(status_code=400, detail="Query is required.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Query is required.",
+        )
 
-    results = retriever.invoke(query)
+    retriever = get_retriever(
+        document_id=str(document.id),
+    )
+
+    results = await run_in_threadpool(
+        retriever.invoke,
+        query,
+    )
 
     return [
-        {
-            "chunk_id": doc.metadata.get("chunk_id", "unknown"),
-            "document_id": doc.metadata.get("document_id", "unknown"),
-            "chunk_index": doc.metadata.get("chunk_index", -1),
-            "text": doc.page_content,
-        }
-        for doc in results
+        ChunkResponse(
+            chunk_id=str(result.metadata.get("chunk_id", "unknown")),
+            document_id=str(result.metadata.get("document_id", document.id)),
+            chunk_index=int(result.metadata.get("chunk_index", -1)),
+            text=result.page_content,
+        )
+        for result in results
     ]
-@router.delete("/{document_id}")
-def delete_doc(document_id: str) -> dict[str, str]:
-    docs = load_docs()
 
-    document_to_delete = None
+@router.delete(
+    "/{document_id}",
+    response_model=DocumentDeleteResponse,
+)
+async def delete_doc(
+    document_id: uuid.UUID,
+    session: Annotated[AsyncSession, Depends(get_db)],
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> DocumentDeleteResponse:
+    document = await get_user_document(
+        session,
+        document_id=document_id,
+        user_id=current_user.id,
+    )
 
-    for doc in docs:
-        if doc["document_id"] == document_id:
-            document_to_delete = doc
-            break
+    if document is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found.",
+        )
 
-    if document_to_delete is None:
-        raise HTTPException(status_code=404, detail="Document not found")
+    uploaded_file = UPLOAD_DIR / document.stored_filename
+    chunk_file = CHUNKS_DIR / f"{document.id}.json"
 
-    file_path = UPLOAD_DIR / str(document_to_delete["stored_filename"])
+    await run_in_threadpool(
+        delete_document_from_vectorstore,
+        str(document.id),
+    )
 
-    if file_path.exists():
-        file_path.unlink()
+    uploaded_file.unlink(missing_ok=True)
+    chunk_file.unlink(missing_ok=True)
 
-    docs.remove(document_to_delete)
-    upload_docs(docs)
+    await delete_document(
+        session,
+        document,
+    )
 
-    return {
-        "document_id": document_id,
-        "detail": "Document deleted successfully.",
-    }
-
+    return DocumentDeleteResponse(
+        document_id=document.id,
+        detail="Document deleted successfully.",
+    )

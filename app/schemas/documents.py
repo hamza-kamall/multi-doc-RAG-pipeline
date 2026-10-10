@@ -23,3 +23,22 @@ class DocumentIndexResponse(DocumentResponse):
     length: int
     num_chunks: int
     embedded_chunks: int
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(
+        min_length=1,
+        max_length=1000,
+    )
+
+
+class ChunkResponse(BaseModel):
+    chunk_id: str
+    document_id: str
+    chunk_index: int
+    text: str
+
+
+class DocumentDeleteResponse(BaseModel):
+    document_id: uuid.UUID
+    detail: str

@@ -68,3 +68,10 @@ async def update_document_status(
 ) -> None:
     document.status = status
     await session.commit()
+
+async def delete_document(
+        session: AsyncSession,
+        document: Document,
+) -> None:
+    await session.delete(document)
+    await session.commit()

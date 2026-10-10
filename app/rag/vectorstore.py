@@ -40,3 +40,11 @@ def add_chunks_to_vectorstore(chunks: list[dict[str, str | int]]) -> int:
 
 
     return len(documents)
+
+def delete_document_from_vectorstore(
+    document_id: str,
+) -> None:
+    vectorstore = get_vectorstore()
+    vectorstore.delete(
+        where={"document_id": document_id},
+    )
